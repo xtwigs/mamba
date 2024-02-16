@@ -159,7 +159,7 @@ class MambaInnerFn(torch.autograd.Function):
     def forward(ctx, xz, conv1d_weight, conv1d_bias, x_proj_weight, delta_proj_weight,
                 out_proj_weight, out_proj_bias,
                 A, B=None, C=None, D=None, delta_bias=None, B_proj_bias=None,
-                C_proj_bias=None, mask=None, delta_softplus=True, checkpoint_lvl=1):
+                C_proj_bias=None, mask=None, delta_softplus=True, checkpoint_lvl=0):
         """
              xz: (batch, dim, seqlen)
         """
@@ -298,7 +298,7 @@ class MambaInnerFn(torch.autograd.Function):
                 dout_proj_weight, dout_proj_bias,
                 dA, dB, dC, dD,
                 ddelta_bias if delta_bias is not None else None,
-                dB_proj_bias, dC_proj_bias, None)
+                dB_proj_bias, dC_proj_bias, None, None)
 
 
 def mamba_inner_fn(
