@@ -147,6 +147,7 @@ def decode(
     vocab_size=None,
     cg=False,
     enable_timing=False,
+    inference_params=None,
     streamer: Optional[TextStreamer] = None,
 ):
     """Decoding, either greedy or with top-k or top-p sampling.
@@ -182,8 +183,10 @@ def decode(
         inference_params = model._decoding_cache.inference_params
         inference_params.reset(max_length, batch_size)
     else:
-        inference_params = InferenceParams(
-            max_seqlen=max_length, max_batch_size=batch_size
+        inference_params = (
+            InferenceParams(max_seqlen=max_length, max_batch_size=batch_size)
+            if inference_params is None
+            else inference_params
         )
 
     def get_logits(input_ids, inference_params):
