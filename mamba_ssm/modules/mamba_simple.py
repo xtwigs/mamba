@@ -125,7 +125,7 @@ class Mamba(nn.Module):
             self.d_inner, self.d_model, bias=bias, **factory_kwargs
         )
 
-    def forward(self, hidden_states, mask=None, inference_params=None):
+    def forward(self, hidden_states, attention_mask=None, inference_params=None):
         """
         hidden_states: (B, L, D)
         Returns: same shape as hidden_states
@@ -175,14 +175,14 @@ class Mamba(nn.Module):
                 None,  # input-dependent C
                 self.D.float(),
                 delta_bias=self.dt_proj.bias.float(),
-                mask=mask,
+                mask=attention_mask,
                 delta_softplus=True,
             )
         else:
             x, z = xz.chunk(2, dim=1)
 
-            if mask is not None:
-                x = x * mask.unsqueeze(1)
+            if attention_mask is not None:
+                x = x * attention_mask.unsqueeze(1)
 
             # Compute short convolution
             if conv_state is not None:
@@ -202,8 +202,8 @@ class Mamba(nn.Module):
                     activation=self.activation,
                 )
 
-            if mask is not None:
-                x = x * mask.unsqueeze(1)
+            if attention_mask is not None:
+                x = x * attention_mask.unsqueeze(1)
 
             # We're careful here about the layout, to avoid extra transposes.
             # We want dt to have d as the slowest moving dimension
