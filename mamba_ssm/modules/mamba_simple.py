@@ -137,7 +137,12 @@ class Mamba(nn.Module):
             conv_state, ssm_state = self._get_states_from_cache(inference_params, batch)
             if inference_params.seqlen_offset > 0:
                 # The states are updated inplace
-                out, _, _ = self.step(hidden_states, conv_state, ssm_state)
+                out, _, _ = self.step(
+                    hidden_states,
+                    conv_state,
+                    ssm_state,
+                    inference_params=inference_params,
+                )
                 out = self.dropout(out)
                 return out
 
@@ -152,7 +157,11 @@ class Mamba(nn.Module):
 
         A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
         # In the backward pass we write dx and dz next to each other to avoid torch.cat
-        if self.use_fast_path and causal_conv1d_fn is not None and inference_params is None:  # Doesn't support outputting the states
+        if (
+            self.use_fast_path
+            and causal_conv1d_fn is not None
+            and inference_params is None
+        ):  # Doesn't support outputting the states
             out = mamba_inner_fn(
                 xz,
                 self.conv1d.weight,
@@ -229,7 +238,13 @@ class Mamba(nn.Module):
         out = self.dropout(out)
         return out
 
-    def step(self, hidden_states, conv_state, ssm_state):
+    def step(
+        self,
+        hidden_states,
+        conv_state,
+        ssm_state,
+        inference_params=None,
+    ):
         dtype = hidden_states.dtype
         assert (
             hidden_states.shape[1] == 1

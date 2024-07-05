@@ -33,6 +33,7 @@ from mamba_ssm.ops.triton.ssd_combined import mamba_split_conv1d_scan_combined
 
 
 class Mamba2(nn.Module):
+
     def __init__(
         self,
         d_model,
@@ -61,6 +62,7 @@ class Mamba2(nn.Module):
         sequence_parallel=True,
         device=None,
         dtype=None,
+        dropout=0.0,
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -148,6 +150,9 @@ class Mamba2(nn.Module):
             self.out_proj = RowParallelLinear(self.d_inner * self.world_size, self.d_model, bias=bias,
                                               process_group=self.process_group, sequence_parallel=self.sequence_parallel,
                                               **factory_kwargs)
+        self.dropout = nn.Dropout(dropout)
+
+
 
     def forward(self, u, seqlen=None, seq_idx=None, cu_seqlens=None, inference_params=None):
         """
@@ -157,6 +162,7 @@ class Mamba2(nn.Module):
             (in case batch is small).
         Returns: same shape as u
         """
+
         seqlen_og = seqlen
         if seqlen is None:
             batch, seqlen, dim = u.shape
@@ -171,6 +177,7 @@ class Mamba2(nn.Module):
             if inference_params.seqlen_offset > 0:
                 # The states are updated inplace
                 out, _, _ = self.step(u, conv_state, ssm_state)
+                out = self.dropout(out)
                 return out
 
         zxbcdt = self.in_proj(u)  # (B, L, d_in_proj) or (B * L, d_in_proj)
@@ -271,6 +278,8 @@ class Mamba2(nn.Module):
             if seqlen_og is not None:
                 y = rearrange(y, "b l d -> (b l) d")
             out = self.out_proj(y)
+
+        out = self.dropout(out)
         return out
 
     def step(self, hidden_states, conv_state, ssm_state):

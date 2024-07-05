@@ -30,6 +30,7 @@ class InferenceParams:
     key_value_memory_dict: dict = field(default_factory=dict)
     lengths_per_sample: Optional[Tensor] = None
 
+
     def reset(self, max_seqlen, max_batch_size):
         self.max_seqlen = max_seqlen
         self.max_batch_size = max_batch_size
