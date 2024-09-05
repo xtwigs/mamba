@@ -280,11 +280,16 @@ class Mamba(nn.Module):
         A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
 
         # SSM step
-        if selective_state_update is None:
+        if selective_state_update is None or inference_params.save_abc is not None:
             # Discretize A and B
             dt = F.softplus(dt + self.dt_proj.bias.to(dtype=dt.dtype))
             dA = torch.exp(torch.einsum("bd,dn->bdn", dt, A))
             dB = torch.einsum("bd,bn->bdn", dt, B)
+
+            inference_params.save_abc[self.layer_idx][0][:, inference_params.seqlen_offset-1, ...] = dA
+            inference_params.save_abc[self.layer_idx][1][:, inference_params.seqlen_offset-1, ...] = dB
+            inference_params.save_abc[self.layer_idx][2][:, inference_params.seqlen_offset-1, ...] = C
+
             ssm_state.copy_(ssm_state * dA + rearrange(x, "b d -> b d 1") * dB)
             y = torch.einsum("bdn,bn->bd", ssm_state.to(dtype), C)
             y = y + self.D.to(dtype) * x

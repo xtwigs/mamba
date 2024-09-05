@@ -154,12 +154,14 @@ class Mamba2(nn.Module):
 
 
 
-    def forward(self, u, seqlen=None, seq_idx=None, cu_seqlens=None, inference_params=None):
+    def forward(self, u, seqlen=None, seq_idx=None, cu_seqlens=None, attention_mask=None, inference_params=None):
         """
         u: (batch, seqlen, hidden_dim) if seqlen=None.
             If seqlen is not None, u is (batch * seqlen, hidden_dim). This is so that when we
             split u during sequence parallel, we split the batch * seqlen dimension
             (in case batch is small).
+        attention_mask: (batch, seqlen)
+            Dummy input, just to match the interface of other models.
         Returns: same shape as u
         """
 

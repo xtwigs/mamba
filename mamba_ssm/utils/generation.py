@@ -29,7 +29,7 @@ class InferenceParams:
     batch_size_offset: int = 0
     key_value_memory_dict: dict = field(default_factory=dict)
     lengths_per_sample: Optional[Tensor] = None
-
+    save_abc: Optional[dict] = None
 
     def reset(self, max_seqlen, max_batch_size):
         self.max_seqlen = max_seqlen
@@ -150,6 +150,7 @@ def decode(
     enable_timing=False,
     inference_params=None,
     streamer: Optional[TextStreamer] = None,
+    capture_recurrent_states=None,
 ):
     """Decoding, either greedy or with top-k or top-p sampling.
     If top-k = 0, don't limit the number of candidates (pure sampling).
@@ -192,6 +193,7 @@ def decode(
 
     def get_logits(input_ids, inference_params):
         decoding = inference_params.seqlen_offset > 0
+
         if decoding:
             position_ids = torch.full(
                 (batch_size, 1),
@@ -246,6 +248,15 @@ def decode(
     sequences_cat = input_ids
     while not should_stop(sequences[-1], inference_params):
         scores.append(get_logits(sequences[-1], inference_params))
+
+        if capture_recurrent_states is not None:
+            capture_recurrent_states.append(
+                [
+                    layer_cache[1].clone().detach()
+                    for _, layer_cache in inference_params.key_value_memory_dict.items()
+                ]
+            )
+
         inference_params.seqlen_offset += sequences[-1].shape[1]
         if repetition_penalty == 1.0:
             sampled_tokens = sample_tokens(scores[-1], inference_params)
