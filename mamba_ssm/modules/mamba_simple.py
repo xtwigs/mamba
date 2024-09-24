@@ -157,6 +157,8 @@ class Mamba(nn.Module):
 
         A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
         # In the backward pass we write dx and dz next to each other to avoid torch.cat
+  
+
         if (
             self.use_fast_path
             and causal_conv1d_fn is not None

@@ -59,6 +59,7 @@ def create_block(
         mixer_cls = partial(
             Mamba2 if ssm_layer == "Mamba2" else Mamba,
             layer_idx=layer_idx,
+            use_fast_path=use_fast_path,
             **ssm_cfg,
             **factory_kwargs,
         )
@@ -257,6 +258,7 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
             vocab_size += pad_vocab_size_multiple - (
                 vocab_size % pad_vocab_size_multiple
             )
+
         self.backbone = MixerModel(
             d_model=d_model,
             n_layer=n_layer,
@@ -305,6 +307,7 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         "position_ids" is just to be compatible with Transformer generation. We don't use it.
         num_last_tokens: if > 0, only return the logits for the last n tokens
         """
+      
         hidden_states = self.backbone(
             input_ids, inference_params=inference_params, **mixer_kwargs
         )

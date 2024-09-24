@@ -152,8 +152,6 @@ class Mamba2(nn.Module):
                                               **factory_kwargs)
         self.dropout = nn.Dropout(dropout)
 
-
-
     def forward(self, u, seqlen=None, seq_idx=None, cu_seqlens=None, attention_mask=None, inference_params=None):
         """
         u: (batch, seqlen, hidden_dim) if seqlen=None.
@@ -178,7 +176,7 @@ class Mamba2(nn.Module):
             conv_state, ssm_state = self._get_states_from_cache(inference_params, inference_batch)
             if inference_params.seqlen_offset > 0:
                 # The states are updated inplace
-                out, _, _ = self.step(u, conv_state, ssm_state)
+                out, _, _ = self.step(u, conv_state, ssm_state, inference_params=inference_params)
                 out = self.dropout(out)
                 return out
 
@@ -284,7 +282,7 @@ class Mamba2(nn.Module):
         out = self.dropout(out)
         return out
 
-    def step(self, hidden_states, conv_state, ssm_state):
+    def step(self, hidden_states, conv_state, ssm_state, inference_params=None):
         dtype = hidden_states.dtype
         assert hidden_states.shape[1] == 1, "Only support decoding with 1 token at a time for now"
         zxbcdt = self.in_proj(hidden_states.squeeze(1))  # (B 2D)
@@ -316,14 +314,22 @@ class Mamba2(nn.Module):
         A = -torch.exp(self.A_log.float())  # (nheads,)
 
         # SSM step
-        if selective_state_update is None:
+        if selective_state_update is None or inference_params.save_abc is not None:
             assert self.ngroups == 1, "Only support ngroups=1 for this inference code path"
             # Discretize A and B
             dt = F.softplus(dt + self.dt_bias.to(dtype=dt.dtype))  # (batch, nheads)
             dA = torch.exp(dt * A)  # (batch, nheads)
             x = rearrange(x, "b (h p) -> b h p", p=self.headdim)
-            dBx = torch.einsum("bh,bn,bhp->bhpn", dt, B, x)
+            dB = torch.einsum("bh,bn->bhn", dt, B)
+            dBx = torch.einsum("bhn,bhp->bhpn", dB, x)
+            # dBx = torch.einsum("bh,bn,bhp->bhpn", dt, B, x)
+
             ssm_state.copy_(ssm_state * rearrange(dA, "b h -> b h 1 1") + dBx)
+
+            inference_params.save_abc[self.layer_idx][0][:, inference_params.seqlen_offset-1, ...] = dA
+            inference_params.save_abc[self.layer_idx][1][:, inference_params.seqlen_offset-1, ...] = dB
+            inference_params.save_abc[self.layer_idx][2][:, inference_params.seqlen_offset-1, ...] = C
+
             y = torch.einsum("bhpn,bn->bhp", ssm_state.to(dtype), C)
             y = y + rearrange(self.D.to(dtype), "h -> h 1") * x
             y = rearrange(y, "b h p -> b (h p)")
