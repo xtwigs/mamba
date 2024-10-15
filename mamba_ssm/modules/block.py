@@ -48,6 +48,12 @@ class Block(nn.Module):
             hidden_states: the sequence to the encoder layer (required).
             residual: hidden_states = Mixer(LN(residual))
         """
+
+        if inference_params is not None and inference_params.save_abc is not None:
+            inference_params.save_abc[self.layer_idx][3][
+                :, inference_params.seqlen_offset - 1, ...
+            ] = hidden_states + residual if residual is not None else hidden_states
+
         if not self.fused_add_norm:
             residual = (hidden_states + residual) if residual is not None else hidden_states
             hidden_states = self.norm(residual.to(dtype=self.norm.weight.dtype))

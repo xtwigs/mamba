@@ -288,10 +288,15 @@ class Mamba(nn.Module):
             dA = torch.exp(torch.einsum("bd,dn->bdn", dt, A))
             dB = torch.einsum("bd,bn->bdn", dt, B)
 
-            inference_params.save_abc[self.layer_idx][0][:, inference_params.seqlen_offset-1, ...] = dA
-            inference_params.save_abc[self.layer_idx][1][:, inference_params.seqlen_offset-1, ...] = dB
-            inference_params.save_abc[self.layer_idx][2][:, inference_params.seqlen_offset-1, ...] = C
-
+            inference_params.save_abc[self.layer_idx][0][
+                :, inference_params.seqlen_offset - 1, ...
+            ] = dA
+            inference_params.save_abc[self.layer_idx][1][
+                :, inference_params.seqlen_offset - 1, ...
+            ] = dB
+            inference_params.save_abc[self.layer_idx][2][
+                :, inference_params.seqlen_offset - 1, ...
+            ] = C
             ssm_state.copy_(ssm_state * dA + rearrange(x, "b d -> b d 1") * dB)
             y = torch.einsum("bdn,bn->bd", ssm_state.to(dtype), C)
             y = y + self.D.to(dtype) * x
