@@ -48,6 +48,7 @@ class Mamba(nn.Module):
         device=None,
         dtype=None,
         dropout=0.1,
+        activation="default",
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -73,6 +74,14 @@ class Mamba(nn.Module):
             padding=d_conv - 1,
             **factory_kwargs,
         )
+
+        activation_map = {
+            "default": nn.SiLU(),
+            "relu": nn.ReLU(),
+        }
+
+        self.pre_mixer_activation = activation
+        self.pre_mixer_act = activation_map[activation]
 
         self.activation = "silu"
         self.act = nn.SiLU()
@@ -157,7 +166,6 @@ class Mamba(nn.Module):
 
         A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
         # In the backward pass we write dx and dz next to each other to avoid torch.cat
-  
 
         if (
             self.use_fast_path
@@ -193,8 +201,10 @@ class Mamba(nn.Module):
                 conv_state.copy_(
                     F.pad(x, (self.d_conv - x.shape[-1], 0))
                 )  # Update state (B D W)
-            if causal_conv1d_fn is None:
-                x = self.act(self.conv1d(x)[..., :seqlen])
+
+            # compatibility with relu
+            if causal_conv1d_fn is None or self.pre_mixer_activation != "default":
+                x = self.pre_mixer_act(self.conv1d(x)[..., :seqlen])
             else:
                 assert self.activation in ["silu", "swish"]
                 x = causal_conv1d_fn(
@@ -255,7 +265,7 @@ class Mamba(nn.Module):
         x, z = xz.chunk(2, dim=-1)  # (B D)
 
         # Conv step
-        if causal_conv1d_update is None:
+        if causal_conv1d_update is None or self.pre_mixer_activation != "default":
             conv_state.copy_(
                 torch.roll(conv_state, shifts=-1, dims=-1)
             )  # Update state (B D W)
@@ -265,8 +275,9 @@ class Mamba(nn.Module):
             )  # (B D)
             if self.conv1d.bias is not None:
                 x = x + self.conv1d.bias
-            x = self.act(x).to(dtype=dtype)
+            x = self.pre_mixer_act(x).to(dtype=dtype)
         else:
+            assert self.activation in ["silu", "swish"]
             x = causal_conv1d_update(
                 x,
                 conv_state,

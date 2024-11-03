@@ -150,6 +150,7 @@ def decode(
     enable_timing=False,
     output_scores=False,
     streamer: Optional[TextStreamer] = None,
+    inference_params: Optional[InferenceParams] = None,
 ):
     """Decoding, either greedy or with top-k or top-p sampling.
     If top-k = 0, don't limit the number of candidates (pure sampling).
@@ -299,6 +300,7 @@ class GenerationMixin:
             min_p=min_p,
             temperature=temperature,
             output_scores=output_scores,
+            attention_mask=attention_mask,
             **kwargs,
         )
         if not output_scores:
