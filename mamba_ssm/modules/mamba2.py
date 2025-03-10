@@ -3,6 +3,7 @@
 import math
 
 import torch
+from torch import Tensor
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -37,6 +38,30 @@ from mamba_ssm.ops.triton.ssd_combined import mamba_split_conv1d_scan_combined
 from huggingface_hub import PyTorchModelHubMixin
 
 
+class AlphaActivation(nn.Module):
+    def __init__(self, activation: nn.Module):
+        super().__init__()
+        self.alpha = 0.0
+        self.prev_act = nn.SiLU()
+        self.activation = activation
+
+    def update_alpha(
+        self,
+        current_step: int,
+        total_steps: int,
+        stable_pct: int = 10,
+        rule: str = "power",
+    ):
+        stable_steps = total_steps // stable_pct
+        if rule == "power":
+            self.alpha = min(current_step / (total_steps - stable_steps), 1.0) ** 2
+        elif rule == "linear":
+            self.alpha = min(current_step / (total_steps - stable_steps), 1.0)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.alpha * self.activation(x) + (1 - self.alpha) * self.prev_act(x)
+
+
 class Mamba2(nn.Module, PyTorchModelHubMixin):
     def __init__(
         self,
@@ -60,14 +85,18 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         conv_bias=True,
         # Fused kernel and sharding options
         chunk_size=256,
-        use_mem_eff_path=False,
+        use_mem_eff_path=True,  # false if we use diff activation
         layer_idx=None,  # Absorb kwarg for general module
         process_group=None,
         sequence_parallel=True,
         device=None,
         dtype=None,
+        activation="default",
+        use_alpha=False,
         dropout=0.0,
-        use_fast_path=None,  # compatibility with config
+        mimetic_layers=[],
+        mimetic_kwargs={},
+        **kwargs,
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -92,7 +121,21 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         self.rmsnorm = rmsnorm
         self.norm_before_gate = norm_before_gate
         self.dt_limit = dt_limit
+
+        activation_map = {
+            "default": nn.SiLU(),
+            "silu": nn.SiLU(),
+            "relu": nn.ReLU(),
+            "identity": nn.Identity(),
+        }
+        self.pre_mixer_activation = activation
+        self.pre_mixer_act = activation_map[activation]
+
+        if use_alpha:
+            self.pre_mixer_act = AlphaActivation(self.pre_mixer_act)
+
         self.activation = "silu"
+
         self.chunk_size = chunk_size
         self.use_mem_eff_path = use_mem_eff_path
         self.layer_idx = layer_idx
@@ -180,6 +223,40 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 **factory_kwargs,
             )
         self.dropout = nn.Dropout(dropout)
+
+        if self.layer_idx in mimetic_layers:
+            self.mimetic_init(**mimetic_kwargs)
+
+    def mimetic_init(
+        self,
+        A_init=True,
+        A_init_constant=-8,
+        dt_init=True,
+        dt_init_constant=0.5413,
+        conv_init=True,
+        x_proj_init=True,
+    ):
+        # A_init = -8  # any reasonably big negative int is fine, -4, -10 work too
+        # dt_init = 0.5413  # inv_softplus(1)
+
+        if A_init:
+            self.A_log.data[:] *= A_init_constant
+
+        if dt_init:
+            self.dt_bias.data *= 0
+            self.dt_bias.data[:] = dt_init_constant  # inv_softplus(1)
+
+        if conv_init:
+            self.conv1d.weight.data[:] *= 0
+            self.conv1d.weight.data[..., -1] = 1
+            self.conv1d.bias.data[:] = 0
+
+        if x_proj_init:
+            n, g, d = self.nheads, self.ngroups, self.d_inner
+            self.in_proj.weight.data[(2 * d) : (2 * d + g * n)] += (
+                self.in_proj.weight.data[(2 * d + g * n) : (2 * d + 2 * g * n)]
+            )
+            self.in_proj.weight.data[(2 * d) : (2 * d + g * n)] /= 2.0
 
     def forward(
         self,
@@ -295,24 +372,30 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                         xBC.squeeze(0), cu_seqlens, state_len=conv_state.shape[-1]
                     )
                     conv_state.copy_(conv_varlen_states)
-            assert self.activation in ["silu", "swish"]
-            if causal_conv1d_fn is None or self.activation not in ["silu", "swish"]:
+            if causal_conv1d_fn is None:
                 assert (
                     seq_idx is None
                 ), "varlen conv1d requires the causal_conv1d package"
-                xBC = self.act(
+                xBC = self.pre_mixer_act(
                     self.conv1d(xBC.transpose(1, 2)).transpose(1, 2)[
                         :, : -(self.d_conv - 1)
                     ]
                 )  # (B, L, self.d_ssm + 2 * ngroups * d_state)
             else:
+                activation = (
+                    self.activation if self.pre_mixer_activation == "default" else None
+                )
                 xBC = causal_conv1d_fn(
                     xBC.transpose(1, 2),
                     rearrange(self.conv1d.weight, "d 1 w -> d w"),
                     bias=self.conv1d.bias,
-                    activation=self.activation,
+                    activation=activation,
                     seq_idx=seq_idx,
                 ).transpose(1, 2)
+
+                if activation is None:
+                    xBC = self.pre_mixer_act(xBC)
+
             x, B, C = torch.split(
                 xBC,
                 [self.d_ssm, self.ngroups * self.d_state, self.ngroups * self.d_state],
@@ -396,13 +479,20 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 xBC = xBC + self.conv1d.bias
             xBC = self.act(xBC).to(dtype=dtype)
         else:
+            activation = (
+                self.activation if self.pre_mixer_activation == "default" else None
+            )
             xBC = causal_conv1d_update(
                 xBC,
                 conv_state,
                 rearrange(self.conv1d.weight, "d 1 w -> d w"),
                 self.conv1d.bias,
-                self.activation,
+                activation,
             )
+
+            # if not default activation, apply pre_mixer_act
+            if activation is None:
+                xBC = self.pre_mixer_act(xBC)
 
         x, B, C = torch.split(
             xBC,
@@ -412,7 +502,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         A = -torch.exp(self.A_log.float())  # (nheads,)
 
         # SSM step
-        if selective_state_update is None or inference_params.save_abc is not None:
+        if selective_state_update is None:
             assert (
                 self.ngroups == 1
             ), "Only support ngroups=1 for this inference code path"
@@ -420,21 +510,9 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             dt = F.softplus(dt + self.dt_bias.to(dtype=dt.dtype))  # (batch, nheads)
             dA = torch.exp(dt * A)  # (batch, nheads)
             x = rearrange(x, "b (h p) -> b h p", p=self.headdim)
-            dB = torch.einsum("bh,bn->bhn", dt, B)
-            dBx = torch.einsum("bhn,bhp->bhpn", dB, x)
-            # dBx = torch.einsum("bh,bn,bhp->bhpn", dt, B, x)
+            dBx = torch.einsum("bh,bn,bhp->bhpn", dt, B, x)
 
             ssm_state.copy_(ssm_state * rearrange(dA, "b h -> b h 1 1") + dBx)
-
-            inference_params.save_abc[self.layer_idx][0][
-                :, inference_params.seqlen_offset - 1, ...
-            ] = dA
-            inference_params.save_abc[self.layer_idx][1][
-                :, inference_params.seqlen_offset - 1, ...
-            ] = dB
-            inference_params.save_abc[self.layer_idx][2][
-                :, inference_params.seqlen_offset - 1, ...
-            ] = C
 
             y = torch.einsum("bhpn,bn->bhp", ssm_state.to(dtype), C)
             y = y + rearrange(self.D.to(dtype), "h -> h 1") * x

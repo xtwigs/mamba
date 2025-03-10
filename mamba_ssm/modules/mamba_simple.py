@@ -28,6 +28,28 @@ except ImportError:
     RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
 
 
+class AlphaActivation(nn.Module):
+    def __init__(self, activation: nn.Module):
+        super().__init__()
+        self.alpha = self.register_buffer("alpha", 0.0)
+        self.prev_act = nn.SiLU()
+        self.activation = activation
+
+    def update_alpha(
+        self,
+        current_step: int,
+        total_steps: int,
+        stable_pct: int = 10,
+        rule: str = "power",
+    ):
+        if rule == "power":
+            stable_steps = total_steps // stable_pct
+            self.alpha = min(current_step / (total_steps - stable_steps), 1.0) ** 2
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.activation(x * self.alpha + (1 - self.alpha) * self.prev_act(x))
+
+
 class Mamba(nn.Module):
     def __init__(
         self,
@@ -47,8 +69,12 @@ class Mamba(nn.Module):
         layer_idx=None,
         device=None,
         dtype=None,
-        dropout=0.1,
+        dropout=0.0,
         activation="default",
+        alpha_activation=False,
+        mimetic_layers=[],
+        mimetic_kwargs={},
+        **kwargs,
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -77,11 +103,16 @@ class Mamba(nn.Module):
 
         activation_map = {
             "default": nn.SiLU(),
+            "silu": nn.SiLU(),
+            "identity": nn.Identity(),
             "relu": nn.ReLU(),
         }
 
         self.pre_mixer_activation = activation
         self.pre_mixer_act = activation_map[activation]
+
+        if alpha_activation:
+            self.pre_mixer_act = AlphaActivation(self.pre_mixer_act)
 
         self.activation = "silu"
         self.act = nn.SiLU()
@@ -134,7 +165,45 @@ class Mamba(nn.Module):
             self.d_inner, self.d_model, bias=bias, **factory_kwargs
         )
 
-    def forward(self, hidden_states, attention_mask=None, inference_params=None):
+        if self.layer_idx in mimetic_layers:
+            self.mimetic_init(**mimetic_kwargs)
+
+    def mimetic_init(
+        self,
+        A_init=True,
+        A_init_constant=-8,
+        dt_init=True,
+        dt_init_constant=0.5413,
+        conv_init=True,
+        x_proj_init=True,
+    ):
+        # A_init = -8  # any reasonably big negative int is fine, -4, -10 work too
+        # dt_init = 0.5413  # inv_softplus(1)
+
+        if A_init:
+            self.A_log.data[:] *= A_init_constant
+
+        if dt_init:
+            self.dt_proj.weight.data *= 0
+            self.dt_proj.bias.data[:] = dt_init_constant
+
+        if conv_init:
+            self.conv1d.weight.data[:] *= 0
+            self.conv1d.weight.data[..., -1] = 1
+            self.conv1d.bias.data[:] = 0
+
+        if x_proj_init:
+            d, r = self.d_state, self.dt_rank
+            self.x_proj.weight.data[r : (r + d)] += self.x_proj.weight.data[(r + d) :]
+            self.x_proj.weight.data[r : (r + d)] /= 2.0
+
+    def forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        inference_params=None,
+        global_step=None,
+    ):
         """
         hidden_states: (B, L, D)
         Returns: same shape as hidden_states
@@ -204,7 +273,9 @@ class Mamba(nn.Module):
 
             # compatibility with relu
             if causal_conv1d_fn is None or self.pre_mixer_activation != "default":
-                x = self.pre_mixer_act(self.conv1d(x)[..., :seqlen])
+                x = self.conv1d(x)[..., :seqlen]
+                x = self.pre_mixer_act(x)
+
             else:
                 assert self.activation in ["silu", "swish"]
                 x = causal_conv1d_fn(
@@ -276,6 +347,7 @@ class Mamba(nn.Module):
             if self.conv1d.bias is not None:
                 x = x + self.conv1d.bias
             x = self.pre_mixer_act(x).to(dtype=dtype)
+
         else:
             assert self.activation in ["silu", "swish"]
             x = causal_conv1d_update(
@@ -293,21 +365,11 @@ class Mamba(nn.Module):
         A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
 
         # SSM step
-        if selective_state_update is None or inference_params.save_abc is not None:
+        if selective_state_update is None:
             # Discretize A and B
             dt = F.softplus(dt + self.dt_proj.bias.to(dtype=dt.dtype))
             dA = torch.exp(torch.einsum("bd,dn->bdn", dt, A))
             dB = torch.einsum("bd,bn->bdn", dt, B)
-
-            inference_params.save_abc[self.layer_idx][0][
-                :, inference_params.seqlen_offset - 1, ...
-            ] = dA
-            inference_params.save_abc[self.layer_idx][1][
-                :, inference_params.seqlen_offset - 1, ...
-            ] = dB
-            inference_params.save_abc[self.layer_idx][2][
-                :, inference_params.seqlen_offset - 1, ...
-            ] = C
             ssm_state.copy_(ssm_state * dA + rearrange(x, "b d -> b d 1") * dB)
             y = torch.einsum("bdn,bn->bd", ssm_state.to(dtype), C)
             y = y + self.D.to(dtype) * x

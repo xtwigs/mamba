@@ -231,7 +231,6 @@ class MixerModel(nn.Module):
 
 
 class MambaLMHeadModel(nn.Module, GenerationMixin):
-
     def __init__(
         self,
         config: MambaConfig,
@@ -307,7 +306,7 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         "position_ids" is just to be compatible with Transformer generation. We don't use it.
         num_last_tokens: if > 0, only return the logits for the last n tokens
         """
-      
+
         hidden_states = self.backbone(
             input_ids, inference_params=inference_params, **mixer_kwargs
         )
@@ -320,7 +319,10 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
     @classmethod
     def from_pretrained(cls, pretrained_model_name, device=None, dtype=None, **kwargs):
         config_data = load_config_hf(pretrained_model_name)
-        config = MambaConfig(**config_data, **kwargs)
+        # update config with kwargs
+        config_data.update(kwargs)
+        print(config_data)
+        config = MambaConfig(**config_data)
         model = cls(config, device=device, dtype=dtype)
         model.load_state_dict(
             load_state_dict_hf(pretrained_model_name, device=device, dtype=dtype)

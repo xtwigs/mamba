@@ -9,7 +9,14 @@ from mamba_ssm.ops.triton.layer_norm import RMSNorm, layer_norm_fn
 
 class Block(nn.Module):
     def __init__(
-        self, dim, mixer_cls, mlp_cls, norm_cls=nn.LayerNorm, fused_add_norm=False, residual_in_fp32=False
+        self,
+        dim,
+        mixer_cls,
+        mlp_cls,
+        norm_cls=nn.LayerNorm,
+        fused_add_norm=False,
+        residual_in_fp32=False,
+        register_gradients=False,
     ):
         """
         Simple block wrapping a mixer class with LayerNorm/RMSNorm and residual connection"
@@ -39,8 +46,23 @@ class Block(nn.Module):
                 self.norm, (nn.LayerNorm, RMSNorm)
             ), "Only LayerNorm and RMSNorm are supported for fused_add_norm"
 
+
+        self.register_gradients = register_gradients
+        if register_gradients:
+            self.gradients = None
+
+    def save_gradients(self, attn_gradients):
+        self.gradients = attn_gradients
+
+    def get_gradients(self):
+        return self.gradients
+
     def forward(
-            self, hidden_states: Tensor, residual: Optional[Tensor] = None, inference_params=None, **mixer_kwargs
+        self,
+        hidden_states: Tensor,
+        residual: Optional[Tensor] = None,
+        inference_params=None,
+        **mixer_kwargs,
     ):
         r"""Pass the input through the encoder layer.
 
@@ -50,13 +72,26 @@ class Block(nn.Module):
         """
 
         if inference_params is not None and inference_params.save_abc is not None:
-            inference_params.save_abc[self.layer_idx][3][
-                :, inference_params.seqlen_offset - 1, ...
-            ] = hidden_states + residual if residual is not None else hidden_states
+            seqlen = hidden_states.size(1)
+            left, right = (
+                inference_params.seqlen_offset,
+                inference_params.seqlen_offset + seqlen,
+            )
+            inference_params.save_abc[self.layer_idx, left:right] = (
+                hidden_states + residual if residual is not None else hidden_states
+            )
 
         if not self.fused_add_norm:
-            residual = (hidden_states + residual) if residual is not None else hidden_states
-            hidden_states = self.norm(residual.to(dtype=self.norm.weight.dtype))
+            residual = (
+                (hidden_states + residual) if residual is not None else hidden_states
+            )
+
+            if self.register_gradients:
+                residual_for_grad = residual.detach().requires_grad_(True)
+                hidden_states = self.norm(
+                    residual_for_grad.to(dtype=self.norm.weight.dtype)
+                )
+                residual_for_grad.register_hook(self.save_gradients)
             if self.residual_in_fp32:
                 residual = residual.to(torch.float32)
         else:
@@ -68,9 +103,11 @@ class Block(nn.Module):
                 prenorm=True,
                 residual_in_fp32=self.residual_in_fp32,
                 eps=self.norm.eps,
-                is_rms_norm=isinstance(self.norm, RMSNorm)
+                is_rms_norm=isinstance(self.norm, RMSNorm),
             )
-        hidden_states = self.mixer(hidden_states, inference_params=inference_params, **mixer_kwargs)
+        hidden_states = self.mixer(
+            hidden_states, inference_params=inference_params, **mixer_kwargs
+        )
 
         if self.mlp is not None:
             if not self.fused_add_norm:
@@ -87,11 +124,13 @@ class Block(nn.Module):
                     prenorm=True,
                     residual_in_fp32=self.residual_in_fp32,
                     eps=self.norm2.eps,
-                    is_rms_norm=isinstance(self.norm2, RMSNorm)
+                    is_rms_norm=isinstance(self.norm2, RMSNorm),
                 )
             hidden_states = self.mlp(hidden_states)
 
         return hidden_states, residual
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
-        return self.mixer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
+        return self.mixer.allocate_inference_cache(
+            batch_size, max_seqlen, dtype=dtype, **kwargs
+        )
